@@ -11,14 +11,14 @@ from torch import nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from model import crnn_github as crnn
+from model import crnn_multitask as crnn
 import utils
 import dataset
 import configure as cfg
 
 
 class Trainer:
-    def __init__(self, trainroot, testroot):
+    def __init__(self, trainroot, testroot, alpha=0.85):
         self.trainroot = trainroot
         self.testroot = testroot
 
@@ -28,12 +28,20 @@ class Trainer:
         torch.manual_seed(cfg.manualSeed)
 
         self.logger = self.setLogger()
-        self.loss = {"train": [], "test": []}
-        self.acc = {"acc": [], "acc_unit": []}
+        self.alpha = alpha
+        self.train_loss = []
+        self.test_loss = []
+        self.test_loss_t = []
+        self.test_loss_c = []
+        self.acc = {'acc': [], 'acc_t': [], 'acc_c': []}
         self.device = torch.device(
             "cuda" if cfg.use_cuda and torch.cuda.is_available() else "cpu")
         self.model = self.net_init().to(self.device)
-        self.codec = dataset.Codec(cfg.alphabet)
+        if cfg.label_type == "both":
+            self.codec = dataset.Codec(cfg.alphabet[0])
+            self.codec_color = dataset.Codec(cfg.alphabet[1])
+        else:
+            self.codec = dataset.Codec(cfg.alphabet)
         self.loss_fn = nn.CTCLoss() if not cfg.dealwith_lossnan else nn.CTCLoss(zero_infinity=True)
         self.loss_fn = self.loss_fn.to(self.device)
         if cfg.adam:
@@ -43,9 +51,6 @@ class Trainer:
             self.optim = optim.Adadelta(self.model.parameters())
         else:
             self.optim = optim.RMSprop(self.model.parameters(), lr=cfg.lr)
-        if cfg.use_lr_scheduler:
-            self.scheduler = optim.lr_scheduler.MultiStepLR(
-                self.optim, milestones=cfg.milestones, gamma=cfg.gamma)
 
     def setLogger(self):
         logger = logging.getLogger("Trainer")
@@ -74,7 +79,8 @@ class Trainer:
 
     def net_init(self):
         self.logger.info(f"Channel of image is {cfg.nc}.")
-        nClass = len(cfg.alphabet) + 1
+        nClass = [l+1 for l in map(len, cfg.alphabet)] if isinstance(
+            cfg.alphabet, tuple) else len(cfg.alphabet) + 1
         model = crnn.CRNN(cfg.imgH, cfg.nc, nClass, cfg.nh)
         model.apply(self.weights_init)
         if cfg.pretrained != '':
@@ -106,18 +112,32 @@ class Trainer:
 
     def train(self, batch):
         self.model.train()
-        image, label = batch  # label is str
-        label, length = self.codec.encode(label)  # label is mathmatical code
+        # read
+        image, label = batch
+        label, label_color = zip(*[ele.split('_') for ele in label])
+
+        # encode
+        label, length = self.codec.encode(label)
+        label_color, length_color = self.codec_color.encode(label_color)
+
         image = image.to(self.device)
         label = label.to(self.device)
+        label_color = label_color.to(self.device)
+
         self.optim.zero_grad()
-        pred = self.model(image)
+        pred, pred_c = self.model(image)
         pred_size = torch.LongTensor([pred.size(0)] * pred.size(1))
+        pred_size_c = torch.LongTensor(
+            [pred_c.size(0)] * pred_c.size(1))
         # Note only pred and label are in cuda
-        loss = self.loss_fn(pred, label, pred_size, length)
+
+        loss_text = self.loss_fn(pred, label, pred_size, length)
+        loss_color = self.loss_fn(
+            pred_c, label_color, pred_size_c, length_color)
+        loss = self.alpha*loss_text + (1-self.alpha)*loss_color
         loss.backward()
         self.optim.step()
-        self.loss["train"].append(loss.item())
+        self.train_loss.append(loss.item())
         return loss
 
     def test(self, test_loader):
@@ -125,72 +145,113 @@ class Trainer:
             "The model is running on the test set, please wait ...")
         self.model.eval()
 
-        nCorrect = nWrong = 0  # 上下两种写法究竟是否同效
-        nTotalUnit, nCorrectUnit = 0, 0
-        loss = 0
+        counter = torch.zeros(2, dtype=torch.float, requires_grad=False)
+        counter_t = torch.zeros(4, dtype=torch.float, requires_grad=False)
+        counter_c = torch.zeros(4, dtype=torch.float, requires_grad=False)
+        loss_t = loss_c = 0
         with torch.no_grad():
-            for image, label_str in test_loader:
-                batch_size = image.size(0)
-                label, length = self.codec.encode(label_str)
+            for batch in test_loader:
+                image, label_str = batch
                 image = image.to(self.device)
-                label = label.to(self.device)
+                pred_t, pred_c = self.model(image)
+                label_str_t, label_str_c = zip(*[ele.split('_')
+                                                 for ele in label_str])
+                check_t = self.checkBatch(pred_t, label_str_t, self.codec)
+                check_c = self.checkBatch(
+                    pred_c, label_str_c, self.codec_color)
 
-                pred = self.model(image)
-                pred_size = torch.LongTensor([pred.size(0)] * batch_size)
-                loss += batch_size * \
-                    self.loss_fn(pred, label, pred_size, length).item()
+                counter_t += check_t[0]
+                counter_c += check_c[0]
+                loss_t += check_t[1]
+                loss_c += check_c[1]
 
-                _, pred = pred.max(2)
-                pred = pred.transpose(1, 0).contiguous().view(-1)
-                simple_pred = self.codec.decode(pred, pred_size, raw=False)
-                for p, t in zip(simple_pred, label_str):  # p: prediction, t: target
+                # simple prediction
+                sp = [sp_t + '_' + sp_c for sp_t,
+                      sp_c in zip(check_t[2], check_c[2])]
+                assert counter_t[0] == counter_c[0]
+                for p, t in zip(sp, label_str):
                     if p == t:
-                        nCorrect += 1
-                    else:
-                        nWrong += 1
-                    nTotalUnit += len(t)
-                    # NOTE `zip` always truncates the longer sequence
-                    for p_char, t_char in zip(p, t):
-                        if p_char == t_char:
-                            nCorrectUnit += 1
-        raw_pred = self.codec.decode(pred, pred_size, raw=True)
-        sample_ind = random.sample(range(batch_size), cfg.nTestDisplay)
-        # rp, p, t: raw prediction, prediction, target
-        for i in sample_ind:
-            rp = raw_pred[i]
-            p = simple_pred[i]
-            t = label_str[i]
-            self.logger.info("%-26s >>> %-26s, GT: %s" % (rp, p, t))
+                        counter[1] += 1
+        batch_size = image.size(0)
+        pred_size_t = torch.LongTensor([pred_t.size(0)] * batch_size)
+        _, pred_t = pred_t.max(2)
+        pred_t = pred_t.transpose(1, 0).contiguous().view(-1)
+        pred_size_c = torch.LongTensor([pred_c.size(0)] * batch_size)
+        _, pred_c = pred_c.max(2)
+        pred_c = pred_c.transpose(1, 0).contiguous().view(-1)
+        # raw prediction text/color
+        rpt = self.codec.decode(pred_t, pred_size_t, raw=True)
+        rpc = self.codec_color.decode(pred_c, pred_size_c, raw=True)
+        sampler_ind = random.sample(range(batch_size), cfg.nTestDisplay)
+        for i in sampler_ind:
+            self.logger.info("%-26s >>> %-26s, GT: %s" %
+                             (rpt[i], check_t[2][i], label_str_t[i]))
+            self.logger.info("%-26s >>> %-26s, GT: %s\n" %
+                             (rpc[i], check_c[2][i], label_str_c[i]))
+        counter[0] = counter_t[0]
+        loss_t /= (counter[0]).item()  # average loss
+        loss_c /= (counter[0]).item()  # average loss
+        loss = self.alpha*loss_t + (1-self.alpha)*loss_c
 
-        loss /= (nCorrect + nWrong)  # average loss
-        self.loss["test"].append(loss)
-        acc = nCorrect / (nCorrect + nWrong)
-        acc_unit = nCorrectUnit / nTotalUnit
-        self.acc["acc"].append(acc)
-        self.acc["acc_unit"].append(acc_unit)
-        self.logger.info("\nTest loss: %f, Accuracy: %f, AccuracyUnit: %f\n" %
-                         (loss, acc, acc_unit))
-        return acc, acc_unit
+        acc = (counter[1]/counter[0]).item()
+        acc_t = (counter_t[1]/counter_t[0]).item()
+        acc_c = (counter_c[1]/counter_c[0]).item()
+        for k, v in zip(self.acc.keys(), [acc, acc_t, acc_c]):
+            self.acc[k].append(v)
+        acc_t_unit = (counter_t[3]/counter_t[2]).item()
+        acc_c_unit = (counter_c[3]/counter_c[2]).item()
+        self.logger.info("Test loss: %f, Accuracy: %f" % (loss, acc))
+        self.logger.info("Test loss of text: %f, Accuracy: %f, AccuracyUnit: %f" %
+                         (loss_t, acc_t, acc_t_unit))
+        self.logger.info("Test loss of color: %f, Accuracy: %f, AccuracyUnit: %f\n" %
+                         (loss_c, acc_c, acc_c_unit))
+
+        self.test_loss.append(loss)
+        self.test_loss_t.append(loss_t)
+        self.test_loss_c.append(loss_c)
+        return acc
+
+    def checkBatch(self, pred, label_str, codec):
+        batch_size = pred.size(1)
+        pred_size = torch.LongTensor([pred.size(0)] * batch_size)
+
+        # check loss
+        label, length = codec.encode(label_str)
+        label = label.to(self.device)
+        loss = batch_size * self.loss_fn(pred, label, pred_size, length).item()
+
+        # check predictions
+        _, pred = pred.max(2)
+        pred = pred.transpose(1, 0).contiguous().view(-1)
+        simple_pred = codec.decode(pred, pred_size, raw=False)
+        nTotal = nCorrect = nTotalUnit = nCorrectUnit = 0
+        for p, t in zip(simple_pred, label_str):  # p: prediction, t: target
+            if p == t:
+                nCorrect += 1
+            else:
+                nTotal += 1
+            nTotalUnit += len(t)
+            # NOTE `zip` always truncates the longer sequence
+            for p_char, t_char in zip(p, t):
+                if p_char == t_char:
+                    nCorrectUnit += 1
+        nTotal += nCorrect
+        counter = torch.tensor(
+            [nTotal, nCorrect, nTotalUnit, nCorrectUnit], dtype=torch.int)
+        return counter, loss, simple_pred
 
     def plot(self):
         plt.style.use('seaborn')
-        fig1, ax1 = plt.subplots()
-        ax1.set(xlabel="Iter Step", ylabel="Loss")
-        x_train = [i+1 for i in range(len(self.loss["train"]))]
-        x_test = [(i+1)*cfg.testInterval for i in range(len(self.loss["test"]))]
-        ax1.plot(x_train, self.loss["train"], '--g', label="Train Loss")
-        ax1.plot(x_test, self.loss["test"], '--r', label="Test Loss")
-
-        fig2, ax2 = plt.subplots()
-        ax2.set(xlabel="Test Step", ylabel="Accuracy")
-        x_acc = range(1, len(self.acc["acc"])+1)
-        ax2.plot(x_acc, self.acc["acc"], label="acc")
-        ax2.plot(x_acc, self.acc["acc_unit"], label="acc_unit")
-        ax2.legend()
+        fig = plt.figure()
+        x_train = [i+1 for i in range(len(self.train_loss))]
+        x_test = [(i+1)*cfg.testInterval for i in range(len(self.test_loss))]
+        plt.plot(x_train, self.train_loss, '--g', label="Train Loss")
+        plt.plot(x_test, self.test_loss, '--r', label="Test Loss")
+        plt.xlabel("Iter Step")
+        plt.ylabel("Loss")
         plt.legend()
-        fig1.savefig("log/loss.png")
-        fig2.savefig("log/acc.png")
-        return fig1, fig2
+        plt.savefig("log/loss.png")
+        return fig
 
     def main(self):
         if not os.path.exists(cfg.weight_dir):
@@ -219,19 +280,20 @@ class Trainer:
                     self.logger.info('[%d/%d][%d/%d] Loss: %f' %
                                      (epoch, cfg.nepoch, i+1, len(train_loader), loss.item()))
                 if batchNo % cfg.testInterval == 0:
-                    acc, acc_unit = self.test(test_loader)
+                    acc = self.test(test_loader)
                     if acc > ACC:
                         torch.save(self.model.state_dict(),
                                    os.path.join(cfg.weight_dir, "checkpoint.pt"))
                         ACC = acc
-            if cfg.use_lr_scheduler:
-                self.scheduler.step()
         self.plot()
         return
 
 
 if __name__ == "__main__":
+    # single task
     path_10w = "/home/chuan/dataset/captcha/raw_data/lmdb"
+
+    # improved 1
     path_31w_red = "/home/chuan/dataset/captcha/red_data/lmdb/"
 
     lmdb_path = path_10w

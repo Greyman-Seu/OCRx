@@ -1,0 +1,6 @@
+# model param
+weights/
+
+# md
+*.md
+!readme.md

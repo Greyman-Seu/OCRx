@@ -1,159 +1,327 @@
+import os
+import shutil
+import logging
 import sys
+import time
+
+import numpy as np
+import pandas as pd
+import cv2 as cv
+
 import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pad_sequence
-from torch.autograd import Variable
-import collections
 
 
-class StrLabelConverter:
-    """Convert between str and label.
+def labelDistribution(srcDir):
+    """Count the distribution of labels of images in a source director.
 
-    NOTE:
-        Insert `blank` to the alphabet for CTC.
-
-    Parameters:
-        alphabet (str): set of the possible characters.
-        ignore_case (bool, default=True): whether or not to ignore all of the case.
+    Returns:
+    --------
+    chars(pd.DateFrame)
+    colors(pd.DateFrame)
     """
+    files = os.listdir(srcDir)
+    chars, colors = [], []
+    for file in files:
+        if file.endswith('.png'):
+            _, label, color = file.split('_')
+            chars.extend(label)
+            colors.extend(color[:-4])
 
-    def __init__(self, alphabet: str, ignore_case=False):
-        self._ignore_case = ignore_case
-        if self._ignore_case:
-            alphabet = alphabet.lower()
-        self.alphabet = alphabet + '-'  # for `-1` index
-        # NOTE: 0 is reserved for 'blank' required by wrap_ctc
-        # 这里用的是alphabet而不是self.alphabet，没有最后的'-'
-        self.dict = {char: i+1 for i, char in enumerate(alphabet)}
-        # NOTE:注意编码使用的是self.dict() blank位于0位
-        # self.alphabet 解码中 - 放在了最后一位
+    # process chars
+    record = {}
+    for char in chars:
+        if char in record:
+            record[char] += 1
+        else:
+            record[char] = 1
+    keys = np.array(list(record.keys()))
+    values = np.array(list(record.values()))
+    sorted_index = np.argsort(values)
+    keys = keys[sorted_index]
+    values = values[sorted_index]
+    chars = pd.DataFrame({'character': keys, 'frequency': values})
 
-    def encode(self, text_seq: list):
-        """Encode a sequence (batch) of texts to a sequence of codes.
+    # process colors
+    record = {}
+    for color in colors:
+        if color in record:
+            record[color] += 1
+        else:
+            record[color] = 1
+    keys = np.array(list(record.keys()))
+    values = np.array(list(record.values()))
+    sorted_index = np.argsort(values)
+    keys, values = keys[sorted_index], values[sorted_index]
+    colors = pd.DataFrame({'color': keys, 'frequency': values})
+
+    return chars, colors
+
+
+class ImageChannelTransformer:
+    def __init__(self, sourceDir, dstDir, digit=8):
+        self.src = os.path.abspath(sourceDir)
+        self.dst = os.path.abspath(dstDir)
+        self.digit = digit
+        self.COUNT = 0
+        self.logger = self.setLogger()
+
+        if os.path.exists(self.dst):
+            shutil.rmtree(self.dst)
+            os.makedirs(self.dst)
+            self.logger.warning(
+                f"Path {self.dst} already exists, the process deletes it and reconstructs a new one.")
+        else:
+            os.makedirs(self.dst)
+
+    def __call__(self):
+        self.main()
+
+    def setLogger(self):
+        logger = logging.getLogger("ImageChannelTransformer")
+        logger.setLevel(logging.DEBUG)
+        c_handler = logging.StreamHandler()
+        parent_dir = os.path.dirname(os.path.abspath(__file__))
+        f_handler = logging.FileHandler(os.path.join(
+            parent_dir, 'log/ImageChannelTransformer.log', 'w'))
+        c_handler.setLevel(level=logging.INFO)
+        f_handler.setLevel(level=logging.INFO)
+        c_format = logging.Formatter(
+            '%(name)s - %(levelname)s - %(message)s')
+        f_format = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        c_handler.setFormatter(c_format)
+        f_handler.setFormatter(f_format)
+        logger.addHandler(c_handler)
+        logger.addHandler(f_handler)
+        return logger
+
+    def transImage(self, file):
+        """Transform a single image."""
+
+        # 读入原图
+        # cv 中默认读入图像是(B,G,R)
+        image = cv.imread(os.path.join(self.src, file))
+        red2red_name = self.transName(file, '红', '红')  # 转换原图名称
+
+        # 蓝色转红色
+        # 蓝色R、G值较小，B值独大，B、G交换，接近红色分布
+        blue2red = cv.cvtColor(image, cv.COLOR_RGB2BGR)
+        blue2red_name = self.transName(file, '蓝', '红')
+
+        # 黑色转红色
+        # 黑色三个通道都比较小， 用255-R通道，则R通道独大，其余通道小，接近红色的分布
+        black2red = image.copy()
+        black2red[:, :, 2] = 255 - black2red[:, :, 2]
+        black2red_name = self.transName(file, '黑', '红')
+
+        # 黄色转红色
+        # 黄色R、G值较大，B值较小，先取反，则R、G值较小, B值独大，接近蓝色分布
+        yellow2red = image.copy()
+        yellow2red = cv.bitwise_not(image)
+        yellow2red = cv.cvtColor(yellow2red, cv.COLOR_RGB2BGR)  # 与蓝色转红色相同
+        yellow2red_name = self.transName(file, '黄', '红')
+
+        # 写入结果
+        names = [red2red_name, blue2red_name, black2red_name, yellow2red_name]
+        imgs = [image, blue2red, black2red, yellow2red]
+        for name, img in zip(names, imgs):
+            if name is not None:
+                self.COUNT += 1
+                newName = f"{self.COUNT:0>{self.digit}d}-{name}"
+                path = os.path.join(self.dst, newName)
+                cv.imwrite(path, img)
+                self.logger.info(f"Write {self.COUNT} transformed images.")
+        return
+
+    def transName(self, filename: str, origin: str, target: str) -> str:
+        """Get the transformed name of an image.
 
         Parameters:
-            text_seq (list of bytes str): texts to convert.
-
-        Returns:
-            codes (2d-torch.LongTensor, batch_size*max_len): encoded texts.
-            lens (1d-torch.LongTensor): lengths of each text.
+        -----------
+        filename: name of the input image
+        origin: original color flag
+        target: target color flag
         """
+        filename = filename.split('-')[-1]  # remove indexNo
+        labels, colors = filename.split('_')
+        indices = [i for i, color in enumerate(colors) if color == origin]
+        if len(indices) == 0:
+            return None
 
-        codes = []
-        lens = []
-        for text in text_seq:
-            text = text.decode('utf-8', 'strict')
-            lens.append(len(text))
-            code = [self.dict[char] for char in text]
-            codes.append(torch.LongTensor(code))
-        codes = pad_sequence(codes, batch_first=True, padding_value=0)  # label进行padding，变为等长
-        lens = torch.LongTensor(lens)
-        return (codes, lens)
+        res = []
+        for i in indices:
+            res.append(labels[i])
+        res.append('_')
+        for _ in indices:
+            res.append(target)
+        res.extend(colors[-4:])  # add ".png"
+        res = ''.join(res)
+        return res
 
-    def decode(self, codes, lens, raw=False):
-        """Decode encoded texts back into strs.
+    def main(self):
+        filenames = os.listdir(self.src)
+        filenames = [
+            filename for filename in filenames if filename.endswith('.png')]
+        filenames.sort()
+        for filename in filenames:
+            self.transImage(filename)
 
-        Args:
-            torch.LongTensor [length_0 + length_1 + ... length_{n - 1}]: encoded texts.
-            torch.LongTensor [n]: length of each text_seq.
+        actual_count = len(os.listdir(self.dst))
+        warning = f"Expect {self.COUNT} pictures, write only {actual_count}!"
+        assert self.COUNT == actual_count, warning
+        return
 
-        Raises:
-            AssertionError: when the texts and its length does not match.
 
-        Returns:
-            text_seq (str or list of str): texts to convert.
+def infer(model, test_loader, device, codec):
+    model.eval()
+    # maker logger
+    logger = logging.getLogger("infer")
+    logger.setLevel(logging.DEBUG)
+    # add file handler
+    parent_dir = os.path.dirname(os.path.abspath(__file__))
+    file_hdlr = logging.FileHandler(os.path.join(
+        parent_dir, 'log/inference.log'), 'w')
+    file_hdlr.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    file_hdlr.setLevel(logging.INFO)
+    logger.addHandler(file_hdlr)
+    # add stream handler
+    stream_hdlr = logging.StreamHandler()
+    stream_hdlr.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    stream_hdlr.setLevel(logging.INFO)
+    logger.addHandler(stream_hdlr)
+    with torch.no_grad():
+        for image, label_text in test_loader:
+            label, _ = codec.encode(label_text)
+            image = image.to(device)
+            label = label.to(device)
+
+            pred = model(image)
+            batch_size = image.size(0)
+            pred_size = torch.LongTensor([pred.size(0)] * batch_size)
+
+            _, pred = pred.max(2)
+            pred = pred.transpose(1, 0).contiguous().view(-1)
+            simple_pred = codec.decode(pred, pred_size, raw=False)
+            raw_pred = codec.decode(pred, pred_size, raw=True)
+            for rp, p, t in zip(raw_pred, simple_pred, label_text):
+                logger.info("%-26s >>> %-26s, GT: %s" % (rp, p, t))
+
+        sample = image[0].unsqueeze(0)
+        begin = time.time()
+        n_test = 100
+        for _ in range(n_test):
+            model(sample)
+        time_cost = (time.time() - begin) / n_test
+        time_cost = round(time_cost, 4)
+        fps = 1 // time_cost
+        logger.info(
+            f"Inference Time Cost: {time_cost} sec/image; FPS: {fps:.0f}")
+
+
+def readInferLog(filename, flag1=">>>", flag2="GT:"):
+    """Resolve the inference log file.
+
+    Returns:
+    --------
+    log (pd.DataFrame): inference log
+    """
+    preds, gts = [], []
+    with open(filename, 'r') as f:
+        template = f.readline()
+        size1, size2 = len(flag1), len(flag2)
+        ind1 = template.find(flag1) + size1 + 1
+        ind2 = template.find(flag2) + size2 + 1
+        assert ind1 != size1 or ind2 != size2, f"Log file error. Unable to find flag {flag1} and {flag2} both."
+        f.seek(0)
+        for line in f:
+            pred = line[ind1:ind2-size2-3].rstrip()  # [ind1, ',')
+            gt = line[ind2:-1].rstrip()  # [ind2, '\n')
+            preds.append(pred)
+            gts.append(gt)
+    # pop the last line
+    gts.pop()
+    preds.pop()
+    log = pd.DataFrame({'GroundTruth': gts, 'Predictions': preds})
+    return log
+
+
+class StatisticalInfo:
+    """Statistics features of CRNN model inference."""
+
+    def __init__(self, log: pd.DataFrame, alphabet: str):
+        # chuan: consider combining with dataset.Codec
+        self.alphabet = alphabet
+        self.char_hash = {char: i for i, char in enumerate(alphabet)}
+        self.log = log
+        self.confusion, self.diff, self._mappings = self.base()
+
+    def base(self):
+        """Basic calculations for general statistics features.
         """
-        if lens.numel() == 1:  # chuan: total number of elements in a tensor
-            lens = lens.item()
-            assert codes.numel() == lens, "text_seq with lens: {} does not match declared lens: {}".format(
-                codes.numel(), lens)
-            if raw:
-                return ''.join([self.alphabet[i - 1] for i in codes])
-            else:
-                char_list = []
-                for i in range(lens):  # 全序列转换
-                    # chuan: ???
-                    if codes[i] != 0 and (not (i > 0 and codes[i - 1] == codes[i])):
-                        # 预测不能为0，且该字符不能和上一字符相等
-                        char_list.append(self.alphabet[codes[i] - 1])
-                        # codes[i] - 1 这边为了弥补 把-放置在最后一位的
-                return ''.join(char_list)
-        else:  # batch mode (codes: (batch_size*26,))
-            assert codes.numel() == lens.sum(
-            ), "texts codes with length: {} does not match declared length: {}".format(codes.numel(), lens.sum())
-            texts = []
-            index = 0
-            for i in range(lens.numel()):  # range(batch)
-                length = lens[i]
-                # chuan: 递归666
-                texts.append(self.decode(
-                    codes[index:index + length], torch.LongTensor([length]), raw=raw))
-                index += length
-            return texts
+        gts = self.log["GroundTruth"]
+        preds = self.log["Predictions"]
 
+        diff_len = {i for i in self.log.index if len(gts[i]) != len(preds[i])}
 
-class Averager(object):
-    """Compute average for `torch.Variable` and `torch.Tensor`. """
+        # 与字符表中字符的顺序保持一致
+        mappings = tuple({} for _ in self.alphabet)
+        for i, (gt, pred) in enumerate(zip(gts, preds)):
+            if i in diff_len:
+                continue
+            for y, x in zip(gt, pred):
+                ind = self.char_hash[y]
+                mapping = mappings[ind]
+                if x not in mapping:
+                    mapping[x] = 1
+                else:
+                    mapping[x] += 1
 
-    def __init__(self):
-        self.reset()
+        # get the confusion matrix
+        header = list(self.alphabet)
+        confusion = pd.DataFrame(mappings, index=header, columns=header)
+        confusion.index.names = ["GroundTruth"]
+        confusion.columns.names = ["Prediction"]
 
-    def add(self, v):
-        if isinstance(v, Variable):
-            count = v.data.numel()
-            v = v.data.sum()
-        elif isinstance(v, torch.Tensor):
-            count = v.numel()
-            v = v.sum()
+        # get items with different lengths of prediction and groundtruth
+        diff = pd.DataFrame([(gts[i], preds[i]) for i in diff_len],
+                            columns=['gts', 'preds'])
 
-        self.n_count += count
-        self.sum += v
+        return confusion, diff, mappings
 
-    def reset(self):
-        self.n_count = 0
-        self.sum = 0
+    @property
+    def acc_total(self):
+        return (self.log.iloc[:, 0] == self.log.iloc[:, 1]).sum() / len(self.log)
 
-    def val(self):
-        res = 0
-        if self.n_count != 0:
-            res = self.sum / float(self.n_count)
+    @property
+    def acc_unit(self):
+        nCorrect = nWrong = 0
+        for (gt, pred) in self.log.values:
+            for t, p in zip(gt, pred):
+                if t == p:
+                    nCorrect += 1
+                else:
+                    nWrong += 1
+        return nCorrect / (nCorrect + nWrong)
+
+    @property
+    def acc_table(self):
+        res = pd.Series(np.diag(self.confusion) / self.confusion.sum(axis=1),
+                        index=self.confusion.index, name='Accuracy')
+        res.sort_values(inplace=True)
+        return res
+
+    def check_char(self, char: str):
+        assert char in self.char_hash, f"Character {char} is not in the alphabet!"
+        ind = self.char_hash[char]
+        res = self._mappings[ind]
+        res['accuracy'] = res[char] / sum(res.values())
+        res = pd.Series(res, name="Frequence/Accuracy")
+        res.index.names = ["Predictions"]
+        res.sort_values(ascending=False, inplace=True)
         return res
 
 
-def oneHot(v, v_length, nc):
-    batchSize = v_length.size(0)
-    maxLength = v_length.max()
-    v_onehot = torch.FloatTensor(batchSize, maxLength, nc).fill_(0)
-    acc = 0
-    for i in range(batchSize):
-        length = v_length[i]
-        label = v[acc:acc + length].view(-1, 1).long()
-        v_onehot[i, :length].scatter_(1, label, 1.0)
-        acc += length
-    return v_onehot
-
-
-def loadData(v, data):
-    with torch.no_grad():
-        v.resize_(data.size()).copy_(data)
-
-
-def prettyPrint(v):
-    print('Size {0}, Type: {1}'.format(str(v.size()), v.data.type()))
-    print('| Max: %f | Min: %f | Mean: %f' % (v.max().data[0], v.min().data[0],
-                                              v.mean().data[0]))
-
-
-def assureRatio(img):
-    """Ensure imgH <= imgW."""
-    b, c, h, w = img.size()
-    if h > w:
-        main = nn.UpsamplingBilinear2d(size=(h, h), scale_factor=None)
-        img = main(img)
-    return img
-
-
-class Logger:
+class PrintLogger:
     def __init__(self, fileN="Default.log"):
         self.terminal = sys.stdout
         self.log = open(fileN, "w")
